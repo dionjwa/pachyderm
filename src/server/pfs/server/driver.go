@@ -1453,12 +1453,11 @@ func (d *driver) deleteCommit(ctx context.Context, commit *pfs.Commit) error {
 			return repos.Put(commit.Repo.Name, repoInfo)
 		}
 
-		// Delete the commit itself and subtract the size of the commit
-		// from repo size.
+		// Delete the commit itself and subtract the size of the commit from repo
+		// size.
 		deleteCommit(commits, commit)
 
-		// Copy the subvenance of 'commit' to a map (deleted) and delete all of
-		// those commits
+		// Delete all of the downstream commits of 'commit'
 		for _, subvCommit := range commitInfo.Subvenance {
 			downstreamRepo := d.commits(subvCommit.Repo.Name).ReadWrite(stm)
 			deleteCommit(downstreamRepo, subvCommit)
@@ -1521,21 +1520,37 @@ func (d *driver) deleteCommit(ctx context.Context, commit *pfs.Commit) error {
 		if err != nil {
 			return err
 		}
-		for _, branchInfo := range branchInfos {
-			// Traverse and rewrite HEAD commit until we find a non-deleted parent or nil
-			for {
-				if branchInfo.Head == nil {
-					break
+		for i := range branchInfos {
+			// extract branch repo/id, but re-read branchInfo inside txn, in case it
+			// changes
+			brokenBranch := branchInfos[i].Branch
+			// Traverse HEAD commit until we find a non-deleted parent or nil; rewrite
+			// branch
+			if _, err := col.NewSTM(ctx, d.etcdClient, func(stm col.STM) error {
+				branches := d.branches(brokenBranch.Repo.Name).ReadWrite(stm)
+				var branchInfo pfs.BranchInfo // re-read branchInfo
+				if err := branches.Get(brokenBranch.Name, &branchInfo); err != nil {
+					if col.IsErrNotFound(err) {
+						// branch is in downstream provenance but doesn't exist yet--nothing
+						// to update
+						return nil
+					}
+					return err
 				}
-				headCommitInfo, headIsDeleted := deleted[branchInfo.Head.ID]
-				if !headIsDeleted {
-					break
+				for {
+					if branchInfo.Head == nil {
+						break
+					}
+					headCommitInfo, headIsDeleted := deleted[branchInfo.Head.ID]
+					if !headIsDeleted {
+						break
+					}
+					branchInfo.Head = headCommitInfo.ParentCommit
 				}
-				branchInfo.Head = headCommitInfo.ParentCommit
-			}
-			// Update branch in etcd
-			if err := d.createBranch(ctx, branchInfo.Branch, branchInfo.Head, branchInfo.Provenance); err != nil {
-				return err
+				return branches.Put(brokenBranch.Name, &branchInfo)
+			}); err != nil {
+				return fmt.Errorf("could not update branch %s/%s: %v",
+					brokenBranch.Repo.Name, brokenBranch.Name, err)
 			}
 		}
 
@@ -1567,9 +1582,11 @@ func (d *driver) deleteCommit(ctx context.Context, commit *pfs.Commit) error {
 				commitInfo.ParentCommit = parentCommitInfo.ParentCommit
 			}
 			// updated commit in etcd
-			col.NewSTM(ctx, d.etcdClient, func(stm col.STM) error {
+			if _, err := col.NewSTM(ctx, d.etcdClient, func(stm col.STM) error {
 				return d.commits(repo).ReadWrite(stm).Put(commitInfo.Commit.ID, &commitInfo)
-			})
+			}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1581,7 +1598,8 @@ func (d *driver) createBranch(ctx context.Context, branch *pfs.Branch, commit *p
 		return err
 	}
 	_, err := col.NewSTM(ctx, d.etcdClient, func(stm col.STM) error {
-		// compute the transitive closure of our provenance
+		// compute the transitive closure of our provenance. Specifically:
+		// ∀ p ∈ prov(branch) . provMap[branchKey(b)] := b
 		provMap := make(map[string]*pfs.Branch)
 		for _, branch := range provenance {
 			provMap[branchKey(branch)] = branch
@@ -1638,7 +1656,7 @@ func (d *driver) createBranch(ctx context.Context, branch *pfs.Branch, commit *p
 					provBranchInfo.Subvenance = append(provBranchInfo.Subvenance, branch)
 					return nil
 				}); err != nil {
-					return err
+					return fmt.Errorf("error upserting new provenant branch: %v", err)
 				}
 				// provBranchInfo contains valid data re:provBranch following Upsert.
 				// Check if there are any commits in provBranch (might need to create a
@@ -1661,8 +1679,9 @@ func (d *driver) createBranch(ctx context.Context, branch *pfs.Branch, commit *p
 				}
 			}
 			if len(commitProvMap) > 0 {
-				// we're updating the branch, but new HEAD commit has exact same
-				// provenance as existing head commit--skip it
+				// If we were to create a new HEAD commit in 'branch', it would have the
+				// exact same provenance as its existing head commit, so don't create
+				// anything
 				if commitInfo != nil {
 					headIsSubset := true
 					for _, c := range commitInfo.Provenance {
